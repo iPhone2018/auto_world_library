@@ -30,6 +30,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -75,7 +76,7 @@ THROTTLE_SLEEP = 60     # 触发限流后首次等待秒（随重试翻倍）
 FLUSH_ROWS = 500        # 每累计新增该条数，将 Excel 追加落盘一次（防意外丢失）
 MAX_ROWS_PER_FILE = 200000  # 单个Excel超过该行数自动归档（另开新文件），避免文件过大加载变慢
 
-# 代理：None 表示自动探测（环境变量 → macOS 系统代理）；可手动指定如 "http://127.0.0.1:7897"
+# 代理：None 表示自动探测（环境变量 → 系统代理：Windows 注册表 / macOS scutil）；可手动指定如 "http://127.0.0.1:7897"
 PROXY_OVERRIDE = None
 
 OUTPUT_DIR = "output"
@@ -125,8 +126,53 @@ FALLBACK_SITES = [
 # ==================== 代理探测 ====================
 
 
+def _windows_system_proxy():
+    """读取 Windows 系统代理（注册表 Internet Settings，Clash/v2rayN 等客户端
+    开启"系统代理"后会写入）。非 Windows 或未启用时返回 None"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            enabled = winreg.QueryValueEx(k, "ProxyEnable")[0]
+            server = winreg.QueryValueEx(k, "ProxyServer")[0]
+    except Exception:
+        return None
+    if not enabled or not server:
+        return None
+    http = https = None
+    # ProxyServer 形如 "127.0.0.1:7890"，或 "http=127.0.0.1:7890;https=...;socks=..."
+    for part in str(server).split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            scheme, _, addr = part.partition("=")
+            scheme = scheme.strip().lower()
+        else:
+            scheme, addr = "", part
+        addr = addr.strip()
+        if not addr or scheme == "socks":   # socks 需要额外安装 PySocks，忽略
+            continue
+        if "://" not in addr:
+            addr = "http://" + addr
+        if scheme == "http" and http is None:
+            http = addr
+        elif scheme == "https" and https is None:
+            https = addr
+        elif not scheme:
+            if http is None:
+                http = addr
+            if https is None:
+                https = addr
+    if http or https:
+        return {"http": http or https, "https": https or http}
+    return None
+
+
 def detect_proxy():
-    """探测可用代理：环境变量 → macOS 系统代理(scutil) → 直连"""
+    """探测可用代理：环境变量 → 系统代理（Windows 注册表 / macOS scutil）→ 直连"""
     if PROXY_OVERRIDE:
         return {"http": PROXY_OVERRIDE, "https": PROXY_OVERRIDE}
     for name in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
@@ -134,6 +180,9 @@ def detect_proxy():
         val = os.environ.get(name)
         if val:
             return {"http": val, "https": val}
+    win = _windows_system_proxy()
+    if win:
+        return win
     try:
         out = subprocess.run(["scutil", "--proxy"], capture_output=True,
                              text=True, timeout=5).stdout
@@ -993,6 +1042,11 @@ class App:
 def main():
     root = tk.Tk()
     app = App(root)
+    if PROXIES:
+        log_print(f"[*] 当前使用代理: {PROXIES['https']}")
+    else:
+        log_print("[!] 未检测到代理，将直连访问；若网络受限，请在配置区设置 PROXY_OVERRIDE，"
+                  "例如 PROXY_OVERRIDE = \"http://127.0.0.1:7890\"（端口看你的代理客户端）")
     root.mainloop()
 
 
