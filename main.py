@@ -43,7 +43,6 @@ import requests
 from openpyxl.styles import Alignment, Font, PatternFill
 
 # ==================== 配置区域 ====================
-
 HOME_URL = "https://worldlibrary.ai/"
 SEARCH_API = "https://worldlibrary.ai/wl-api/search/search"
 TRANSLATE_API = "https://worldlibrary.ai/wl-api/ai/book-translate"
@@ -52,36 +51,32 @@ SEARCH_PAGE_TPL = "https://worldlibrary.ai/search/{key}?keyword=&way=search-ai"
 HOME_PAGE_TPL = "https://worldlibrary.ai/home/{key}"
 BOOK_URL_TPL = "https://worldlibrary.ai/book/{key}/{book_id}"
 
-PAGE_SIZE = 20          # 接口每页固定最多返回 20 条
-WINDOW_LIMIT = 9980     # 接口限制 from+size<=10000，单查询最多覆盖 9980+20 条
-ALNUM = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-# 标题词条字典序切分的顶层范围（[lo TO hi]，lo 为 "*" 表示开区间下界）。
+PAGE_SIZE = 20  # 接口每页固定最多返回 20 条
+WINDOW_LIMIT = 9980  # 接口限制 from+size<=10000，单查询最多覆盖 9980+20 条
+ALNUM = "0123456789abcdefghijklmnopqrstuvwxyz"  # 标题词条字典序切分的顶层范围（[lo TO hi]，lo 为 "*" 表示开区间下界）。
 # 各范围首尾相接（上一范围末尾字符开头的词条归入下一范围），覆盖书名所有词条。
 TOP_TITLE_RANGES = [
-    ("*", "9"),            # 数字开头的词条（年份等）
-    ("a", "z"),            # 拉丁字母
-    ("À", "ÿ"),            # 拉丁扩展
-    ("Ā", "⿿"),           # 希腊/西里尔/希伯来/阿拉伯/天城文/泰文等
-    ("ぁ", "鿿"),          # 日文假名 + CJK
-    ("ꀀ", "￿"),           # 彝文/谚文/兼容字符等
+    ("*", "9"),  # 数字开头的词条（年份等）
+    ("a", "z"),  # 拉丁字母
+    ("À", "ÿ"),  # 拉丁扩展
+    ("Ā", "⿿"),  # 希腊/西里尔/希伯来/阿拉伯/天城文/泰文等
+    ("ぁ", "鿿"),  # 日文假名 + CJK
+    ("ꀀ", "￿"),  # 彝文/谚文/兼容字符等
 ]
 
 REQUEST_INTERVAL = 3  # 搜索接口每次调用后 sleep 的秒数（太短会频繁触发限流）
 TRANSLATE_INTERVAL = 0.2  # 翻译接口每次调用后 sleep 的秒数
-API_TIMEOUT = 60        # 单次请求超时秒
-API_RETRY = 4           # 失败/限流重试次数
-API_RETRY_SLEEP = 5     # 网络异常重试前等待秒
-THROTTLE_SLEEP = 60     # 触发限流后首次等待秒（随重试翻倍）
-FLUSH_ROWS = 500        # 每累计新增该条数，将 Excel 追加落盘一次（防意外丢失）
+API_TIMEOUT = 60  # 单次请求超时秒
+API_RETRY = 4  # 失败/限流重试次数
+API_RETRY_SLEEP = 5  # 网络异常重试前等待秒
+THROTTLE_SLEEP = 60  # 触发限流后首次等待秒（随重试翻倍）
+FLUSH_ROWS = 500  # 每累计新增该条数，将 Excel 追加落盘一次（防意外丢失）
 MAX_ROWS_PER_FILE = 200000  # 单个Excel超过该行数自动归档（另开新文件），避免文件过大加载变慢
 
-# 代理：None 表示自动探测（环境变量 → 系统代理：Windows 注册表 / macOS scutil）；可手动指定如 "http://127.0.0.1:7897"
-PROXY_OVERRIDE = None
+# 【方案A Clash Verge Mixed HTTP端口】如你的端口不是7891，请修改此处
+PROXY_OVERRIDE = "http://127.0.0.1:7891"
 
-OUTPUT_DIR = "output"
-
-# 输出列（与《书籍信息采集模板.xlsx》一致）
+OUTPUT_DIR = "output"  # 输出列（与《书籍信息采集模板.xlsx》一致）
 EXCEL_COLUMNS = ["书籍ID", "书籍名称", "作者", "出版社", "出版时间", "ISBN",
                  "页数", "书籍封面链接", "书籍链接", "SSN号", "读秀号"]
 
@@ -123,11 +118,11 @@ FALLBACK_SITES = [
     ("southasia", "South Asia", "南亚"),
 ]
 
+
 # ==================== 代理探测 ====================
 
-
 def _windows_system_proxy():
-    """读取 Windows 系统代理（注册表 Internet Settings，Clash/v2rayN 等客户端
+    """读取 Windows 系统代理（注册表 Internet Settings，Clash Verge/v2rayN 等客户端
     开启"系统代理"后会写入）。非 Windows 或未启用时返回 None"""
     if sys.platform != "win32":
         return None
@@ -141,8 +136,9 @@ def _windows_system_proxy():
         return None
     if not enabled or not server:
         return None
-    http = https = None
-    # ProxyServer 形如 "127.0.0.1:7890"，或 "http=127.0.0.1:7890;https=...;socks=..."
+
+    http = https = socks5 = None
+    # ProxyServer 形如 "socks=127.0.0.1:7890;http=127.0.0.1:7891;https=127.0.0.1:7891"
     for part in str(server).split(";"):
         part = part.strip()
         if not part:
@@ -153,26 +149,33 @@ def _windows_system_proxy():
         else:
             scheme, addr = "", part
         addr = addr.strip()
-        if not addr or scheme == "socks":   # socks 需要额外安装 PySocks，忽略
+        if not addr:
             continue
         if "://" not in addr:
-            addr = "http://" + addr
-        if scheme == "http" and http is None:
+            addr = f"{scheme}://{addr}"
+        if scheme == "http":
             http = addr
-        elif scheme == "https" and https is None:
+        elif scheme == "https":
             https = addr
+        elif scheme == "socks":
+            socks5 = addr
         elif not scheme:
+            # 无scheme旧格式，当做http
             if http is None:
-                http = addr
+                http = f"http://{addr}"
             if https is None:
-                https = addr
+                https = f"http://{addr}"
+
+    # 优先级 http/https > socks5；Clash Verge系统代理默认写socks
     if http or https:
         return {"http": http or https, "https": https or http}
+    if socks5:
+        return {"http": socks5, "https": socks5}
     return None
 
 
 def detect_proxy():
-    """探测可用代理：环境变量 → 系统代理（Windows 注册表 / macOS scutil）→ 直连"""
+    """探测可用代理：PROXY_OVERRIDE > 环境变量 > Windows注册表系统代理 > macOS scutil > 直连"""
     if PROXY_OVERRIDE:
         return {"http": PROXY_OVERRIDE, "https": PROXY_OVERRIDE}
     for name in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
@@ -198,6 +201,17 @@ def detect_proxy():
 
 
 PROXIES = detect_proxy()
+
+# socks代理依赖检查：如果代理url以socks开头，检查是否安装requests[socks]
+if PROXIES:
+    p_url = PROXIES.get("http", "")
+    if p_url.startswith("socks5://"):
+        try:
+            import requests.socks
+        except ImportError:
+            print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print("检测到SOCKS5代理，请执行安装依赖：pip install requests[socks]")
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
 # ==================== 全局停止控制 ====================
 _stop_event = threading.Event()
@@ -255,10 +269,11 @@ def build_body(site_key: str, query: str = "*", filters: dict = None,
         "sort_field": "publication_year",
         "sort_order": "desc",
     }
-    if site_key != "main":          # 主站点不带 collection，其余站点按站点 key 过滤合集
+    if site_key != "main":
+        # 主站点不带 collection，其余站点按站点 key 过滤合集
         body["collection"] = [site_key]
     filters = filters or {}
-    has_filter = True               # 请求体始终带 document_type=["book"] 过滤
+    has_filter = True  # 请求体始终带 document_type=["book"] 过滤
     for dim in FILTER_DIMS:
         if filters.get(dim):
             body[dim] = list(filters[dim])
@@ -453,8 +468,8 @@ class BookStore:
         self.flush_every = flush_every
         self.path = os.path.join(OUTPUT_DIR, f"worldlibrary_{site_key}.xlsx")
         self.ids_path = os.path.join(OUTPUT_DIR, f"worldlibrary_{site_key}_ids.txt")
-        self.seen_ids = set()       # 已入库书籍ID（内存中以整数/字符串存储）
-        self.pending_ids = []       # 本次新增待登记到 ids.txt 的ID
+        self.seen_ids = set()  # 已入库书籍ID（内存中以整数/字符串存储）
+        self.pending_ids = []  # 本次新增待登记到 ids.txt 的ID
 
         header_ok = self._check_existing_header()
         # txt 注册表优先；无有效Excel时只读txt，避免把损坏文件内容当ID
@@ -471,16 +486,16 @@ class BookStore:
             log_print(f"[!] 已有文件 {os.path.basename(bad)} 表头不匹配或打开失败，"
                       f"已改名备份，本次新建 {os.path.basename(self.path)}")
         if header_ok and os.path.exists(self.path):
-            self.wb = openpyxl.load_workbook(self.path)   # 续写已有文件
+            self.wb = openpyxl.load_workbook(self.path)  # 续写已有文件
             self.ws = self.wb.active
         else:
             self._create_new_workbook()
 
         self.row_count = self.ws.max_row - 1
         self.pending = 0
-        self.added = 0      # 本次运行新增
-        self.dup = 0        # 重复跳过（含历史已采集）
-        self.non_book = 0   # 非 book 类型跳过
+        self.added = 0  # 本次运行新增
+        self.dup = 0  # 重复跳过（含历史已采集）
+        self.non_book = 0  # 非 book 类型跳过
         if self.row_count >= MAX_ROWS_PER_FILE:
             self._rotate()  # 已有文件已超上限：先归档再续写
 
@@ -523,7 +538,7 @@ class BookStore:
                     wb_ro = openpyxl.load_workbook(fp, read_only=True)
                     try:
                         rows = wb_ro.active.iter_rows(values_only=True)
-                        next(rows, None)    # 跳过表头
+                        next(rows, None)  # 跳过表头
                         for row in rows:
                             if row and row[0]:
                                 raw_ids.append(str(row[0]).strip())
@@ -677,7 +692,7 @@ def paginate_chunk(site_key: str, query: str, store: BookStore,
     if total == 0:
         return True
     pages = math.ceil(total / PAGE_SIZE)
-    verbose = pages <= 10   # 小分片每页都打日志（每页含翻译，耗时约1分钟，避免看起来卡住）
+    verbose = pages <= 10  # 小分片每页都打日志（每页含翻译，耗时约1分钟，避免看起来卡住）
     hits1 = first_page.get("hits") or []
     if verbose:
         log_print(f"[采集] {label} 第 1/{pages} 页 本页{len(hits1)}条 处理中...")
@@ -809,7 +824,7 @@ def split_range(site_key: str, lo: str, hi: str, store: BookStore,
         return False
     if c2 <= WINDOW_LIMIT:
         return paginate_chunk(site_key, q2, store, first_page=j2, label=q2, filters=filters)
-    # 超限：说明该字符被分析器折叠（如 À→a），对应书籍已由 a-z 等区间覆盖，跳过
+    # 超限：说明该字符被分析器折叠（如 À→a），对应书籍已由 a‑z 等区间覆盖，跳过
     log_print(f"[*] 词条 {lo} 开头查询到 {c2} 本（超过单查询上限），"
               f"这些书应已由其它分片覆盖，跳过")
     return True
@@ -927,7 +942,7 @@ class App:
         self.running = False
         self.worker_thread = None
         self.consume_log_queue()
-        self.load_sites()   # 启动时后台获取站点列表
+        self.load_sites()  # 启动时后台获取站点列表
 
     def consume_log_queue(self):
         try:
