@@ -10,8 +10,11 @@ worldlibrary.ai 电子书信息采集工具
    - 调用 https://worldlibrary.ai/wl-api/search/search（POST）翻页采集，
      每页固定最多 20 条，每次调用接口后 sleep 间隔秒；请求体带 document_type=book
      过滤（服务端只返回电子书），可选 publication_year_from/to 按出版年份过滤
-   - 接口限制 from+size <= 10000：站点总量超过 9980 时，自动按书名标题的词条字典序
-     范围（title:[lo TO hi]）递归二分切分，保证全部书籍都被完整覆盖采集
+   - 接口限制 from 最大 9980（单个排序方向只够到 10000 条），超量时分两级突破：
+     1) 正序取前 10000 条 + 倒序取后 10000 条拼接，单个查询可覆盖到 20000 条
+     2) 仍超 20000 条时，按 facet 聚合（language 等）切成互斥子分区逐个递归；
+        分区维度需通过可信度检查（无漏桶、非多值字段）且比直接拼接更划算才采用
+     覆盖不到的部分会在日志中如实报告数量（接口能力所限，无法做到 100%）
    - 逐本调用 https://worldlibrary.ai/wl-api/ai/book-translate 将英文书名翻译为中文
      （标题已含中文则跳过翻译，翻译失败回退原文）
    - 输出：每个站点一个"当前"Excel（output/worldlibrary_{站点key}.xlsx），
@@ -22,7 +25,11 @@ worldlibrary.ai 电子书信息采集工具
 
 说明：
 - 书籍封面链接按官网 JS 中的规律由书籍ID直接拼接（官网本身也不校验是否存在）
-- 接口有请求频率限制（约十几秒内十几次），触发后自动等待 60 秒起（翻倍）重试
+- 搜索接口有频率限制（突发约 10 次即被拒），由全局节流器统一配速；触发后
+  必须完全静默一段时间才能恢复——被拒的请求同样计入窗口，边等边试只会
+  不断延长惩罚（实测每 5 秒探一次，124 秒都没恢复；完全静默 30 秒即恢复）
+- 所有请求走同一个 keep-alive 会话，避免每本书都重新握手（那样既慢十倍，
+  又容易被中途掐断报 SSL: UNEXPECTED_EOF_WHILE_READING）
 """
 
 import glob
@@ -32,7 +39,9 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 from queue import Empty, Queue
 from tkinter import scrolledtext, ttk
@@ -43,6 +52,7 @@ import requests
 from openpyxl.styles import Alignment, Font, PatternFill
 
 # ==================== 配置区域 ====================
+
 HOME_URL = "https://worldlibrary.ai/"
 SEARCH_API = "https://worldlibrary.ai/wl-api/search/search"
 TRANSLATE_API = "https://worldlibrary.ai/wl-api/ai/book-translate"
@@ -51,32 +61,51 @@ SEARCH_PAGE_TPL = "https://worldlibrary.ai/search/{key}?keyword=&way=search-ai"
 HOME_PAGE_TPL = "https://worldlibrary.ai/home/{key}"
 BOOK_URL_TPL = "https://worldlibrary.ai/book/{key}/{book_id}"
 
-PAGE_SIZE = 20  # 接口每页固定最多返回 20 条
-WINDOW_LIMIT = 9980  # 接口限制 from+size<=10000，单查询最多覆盖 9980+20 条
-ALNUM = "0123456789abcdefghijklmnopqrstuvwxyz"  # 标题词条字典序切分的顶层范围（[lo TO hi]，lo 为 "*" 表示开区间下界）。
-# 各范围首尾相接（上一范围末尾字符开头的词条归入下一范围），覆盖书名所有词条。
-TOP_TITLE_RANGES = [
-    ("*", "9"),  # 数字开头的词条（年份等）
-    ("a", "z"),  # 拉丁字母
-    ("À", "ÿ"),  # 拉丁扩展
-    ("Ā", "⿿"),  # 希腊/西里尔/希伯来/阿拉伯/天城文/泰文等
-    ("ぁ", "鿿"),  # 日文假名 + CJK
-    ("ꀀ", "￿"),  # 彝文/谚文/兼容字符等
-]
+PAGE_SIZE = 20          # 接口每页固定最多返回 20 条
+MAX_FROM = 9980         # 接口硬限制：from 最大 9980，from=10000 起返回空
+WINDOW_LIMIT = MAX_FROM + PAGE_SIZE     # 单个排序方向最多够到 10000 条
+FLIP_LIMIT = WINDOW_LIMIT * 2           # 正序+倒序两趟，最多够到 20000 条
+SEAM_MARGIN = 200       # 正倒序拼接处的重叠冗余条数（同名书排序不稳定，留余量防缺口）
 
-REQUEST_INTERVAL = 3  # 搜索接口每次调用后 sleep 的秒数（太短会频繁触发限流）
+# 分区维度：按 facet 聚合切分。这些维度单值且分桶精确（实测 language 分桶
+# 计数与过滤结果完全一致、sum_other_doc_count=0），是真正互斥的分区键。
+# 注意：不要用 title:[lo TO hi] 做分片——那是 ES 分词后的 token 范围查询，
+# title:[a TO a] 会命中任何含独立单词 "a" 的书名（实测 [a TO z] 命中
+# 19778/19784，几乎等于全量），分片严重重叠且递归不收敛。
+PARTITION_DIMS = ["language", "publisher", "subject"]
+FACET_SIZE = 300        # 分桶上限，要能装下一个维度的全部取值，否则分区会有缺口
+
+# 搜索接口节流参数（令牌桶 + 轮次硬边界，全部来自压测，别凭感觉改）：
+# - 实测配额约"30 次 / 3 分钟"，突发到第 11 次即被拒
+# - "9 次快发 + 静默 70 秒"压测 63 次零限流、6.7s/次；60 秒周期仍有 1~2 次限流，
+#   30/45 秒在第 30 次就崩，匀速 6.5s/次也会崩——必须保留轮次间的硬空窗
+# - 轮内连发时令牌桶管速度，轮间靠"每 70 秒最多 9 次"的硬边界留出空窗；
+#   翻页时翻译已把请求拖慢到 ~9 秒/次，硬边界几乎不拦
+REQUEST_INTERVAL = 60.0 / 9      # 基准：一个令牌约 6.7 秒（轮内连续快发时用）
+SEARCH_BURST = 9                 # 每轮最多发 9 次
+SEARCH_BURST_PERIOD = 70.0       # 每轮时间窗口（即"9 次 + 静默 70 秒"的周期）
+SEARCH_MAX_INTERVAL = 12.0       # 触发限流后补充间隔最多拉到 12 秒
+SEARCH_RECOVER_AFTER = 8         # 连续顺利多少次就把间隔收回一档
 TRANSLATE_INTERVAL = 0.2  # 翻译接口每次调用后 sleep 的秒数
-API_TIMEOUT = 60  # 单次请求超时秒
-API_RETRY = 4  # 失败/限流重试次数
-API_RETRY_SLEEP = 5  # 网络异常重试前等待秒
-THROTTLE_SLEEP = 60  # 触发限流后首次等待秒（随重试翻倍）
-FLUSH_ROWS = 500  # 每累计新增该条数，将 Excel 追加落盘一次（防意外丢失）
+API_TIMEOUT = 60        # 单次请求超时秒
+# 搜索接口失败会丢真实数据，退避给足：8/16/32/64/128 秒，累计约 4 分钟
+# （持续压测时服务端会直接 RST 连接，短退避扛不过去）
+API_RETRY = 5           # 失败/限流重试次数
+API_RETRY_SLEEP = 8     # 网络异常重试前等待秒（每次重试翻倍）
+# 触发限流后的静默冷却：实测完全静默 30 秒即恢复，而边等边探 124 秒都没恢复，
+# 所以这段时间内绝不能再发请求（节流器的 penalize 会同时清空窗口记录）
+THROTTLE_SLEEP = 35     # 触发限流后首次静默秒数（随重试翻倍）
+TRANSLATE_RETRY = 2         # 翻译接口重试次数（失败可回退英文原名，不值得久等）
+TRANSLATE_RETRY_SLEEP = 2   # 翻译接口重试前等待秒
+FLUSH_ROWS = 500        # 每累计新增该条数，将 Excel 追加落盘一次（防意外丢失）
 MAX_ROWS_PER_FILE = 200000  # 单个Excel超过该行数自动归档（另开新文件），避免文件过大加载变慢
 
-# 【方案A Clash Verge Mixed HTTP端口】如你的端口不是7891，请修改此处
-PROXY_OVERRIDE = "http://127.0.0.1:7891"
+# 代理：None 表示自动探测（环境变量 → 系统代理：Windows 注册表 / macOS scutil）；可手动指定如 "http://127.0.0.1:7897"
+PROXY_OVERRIDE = None
 
-OUTPUT_DIR = "output"  # 输出列（与《书籍信息采集模板.xlsx》一致）
+OUTPUT_DIR = "output"
+
+# 输出列（与《书籍信息采集模板.xlsx》一致）
 EXCEL_COLUMNS = ["书籍ID", "书籍名称", "作者", "出版社", "出版时间", "ISBN",
                  "页数", "书籍封面链接", "书籍链接", "SSN号", "读秀号"]
 
@@ -118,11 +147,11 @@ FALLBACK_SITES = [
     ("southasia", "South Asia", "南亚"),
 ]
 
-
 # ==================== 代理探测 ====================
 
+
 def _windows_system_proxy():
-    """读取 Windows 系统代理（注册表 Internet Settings，Clash Verge/v2rayN 等客户端
+    """读取 Windows 系统代理（注册表 Internet Settings，Clash/v2rayN 等客户端
     开启"系统代理"后会写入）。非 Windows 或未启用时返回 None"""
     if sys.platform != "win32":
         return None
@@ -136,9 +165,8 @@ def _windows_system_proxy():
         return None
     if not enabled or not server:
         return None
-
-    http = https = socks5 = None
-    # ProxyServer 形如 "socks=127.0.0.1:7890;http=127.0.0.1:7891;https=127.0.0.1:7891"
+    http = https = None
+    # ProxyServer 形如 "127.0.0.1:7890"，或 "http=127.0.0.1:7890;https=...;socks=..."
     for part in str(server).split(";"):
         part = part.strip()
         if not part:
@@ -149,33 +177,26 @@ def _windows_system_proxy():
         else:
             scheme, addr = "", part
         addr = addr.strip()
-        if not addr:
+        if not addr or scheme == "socks":   # socks 需要额外安装 PySocks，忽略
             continue
         if "://" not in addr:
-            addr = f"{scheme}://{addr}"
-        if scheme == "http":
+            addr = "http://" + addr
+        if scheme == "http" and http is None:
             http = addr
-        elif scheme == "https":
+        elif scheme == "https" and https is None:
             https = addr
-        elif scheme == "socks":
-            socks5 = addr
         elif not scheme:
-            # 无scheme旧格式，当做http
             if http is None:
-                http = f"http://{addr}"
+                http = addr
             if https is None:
-                https = f"http://{addr}"
-
-    # 优先级 http/https > socks5；Clash Verge系统代理默认写socks
+                https = addr
     if http or https:
         return {"http": http or https, "https": https or http}
-    if socks5:
-        return {"http": socks5, "https": socks5}
     return None
 
 
 def detect_proxy():
-    """探测可用代理：PROXY_OVERRIDE > 环境变量 > Windows注册表系统代理 > macOS scutil > 直连"""
+    """探测可用代理：环境变量 → 系统代理（Windows 注册表 / macOS scutil）→ 直连"""
     if PROXY_OVERRIDE:
         return {"http": PROXY_OVERRIDE, "https": PROXY_OVERRIDE}
     for name in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
@@ -202,17 +223,6 @@ def detect_proxy():
 
 PROXIES = detect_proxy()
 
-# socks代理依赖检查：如果代理url以socks开头，检查是否安装requests[socks]
-if PROXIES:
-    p_url = PROXIES.get("http", "")
-    if p_url.startswith("socks5://"):
-        try:
-            import requests.socks
-        except ImportError:
-            print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            print("检测到SOCKS5代理，请执行安装依赖：pip install requests[socks]")
-            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-
 # ==================== 全局停止控制 ====================
 _stop_event = threading.Event()
 
@@ -232,12 +242,138 @@ def interval_sleep(seconds: float):
         raise TaskStoppedException()
 
 
+# 翻译失败累计计数（非致命，仅用于结束时汇总）
+_translate_fail = 0
+
 # ==================== 线程安全日志队列 ====================
 LOG_QUEUE = Queue(maxsize=2000)
 
 
 def log_print(text):
     LOG_QUEUE.put(text)
+
+
+# ==================== 搜索接口节流 ====================
+
+class RateLimiter:
+    """搜索接口的全局节流器（令牌桶）。
+
+    实测该接口是"约 30 次 / 3 分钟"的窗口配额，而不是短突发限制。压测结论：
+    - 突发约 10 次即被拒；
+    - 9 次快发 + 静默 60 秒，长跑 72 次零限流；静默 30/45 秒都会在第 30 次崩；
+    - 平滑配速反而更差：匀速 6.5 秒/次同样在第 30 次崩，因为窗口滚不过去。
+    所以按"桶容量 9、每 60 秒回满"实现令牌桶——它天然复刻批量+静默的节奏。
+
+    另一个好处是自适应：翻页时翻译已经把搜索拖慢到约 9 秒/次，令牌桶根本不拦；
+    只有分区扫描这类连续快发才会形成"快发 9 次 → 静默等桶回满"。
+
+    触发限流时桶清空并按倍率降速（宁可慢、不可再被罚）；长期顺利逐步收回。"""
+
+    def __init__(self, capacity: int, refill_interval: float,
+                 burst_period: float, max_refill_interval: float,
+                 recover_after: int = 20):
+        self.capacity = capacity                    # 桶容量（即最多连发几次）
+        self.base_interval = refill_interval        # 一个令牌多久补充（基准）
+        self.interval = refill_interval             # 当前补充间隔
+        self.max_interval = max_refill_interval
+        self.recover_after = recover_after
+        self.burst_period = burst_period            # 每轮 burst_period 秒最多 capacity 次
+        self.tokens = float(capacity)
+        self.last = time.monotonic()
+        self.burst_start = time.monotonic()         # 本轮第 1 次的时刻
+        self.burst_used = 0                         # 本轮已用次数
+        self.ok_streak = 0
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        """阻塞到可以安全发下一个请求（等待期间响应停止信号）
+
+        规则 = 令牌桶 + 轮次硬边界：
+        - 每 burst_period 秒最多 capacity 次（实测 9 次/60s 是零限流的安全节奏）
+        - 轮内连发则令牌耗尽，自然排到轮次之后，形成"快发 N 次 → 静默"的空窗
+        - 翻页时翻译已把请求拖慢，轮次边界几乎不拦，只在连续快发时生效"""
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if self.burst_used >= self.capacity:
+                    # 本轮配额用尽：等到本轮结束（下一轮从 burst_start+period 起）
+                    wait = self.burst_start + self.burst_period - now
+                    if wait <= 0:
+                        self.burst_start = now
+                        self.burst_used = 0
+                    else:
+                        interval_sleep(wait)
+                        continue
+                self.tokens = min(self.capacity, self.tokens
+                                  + (now - self.last) / self.interval)
+                self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    self.burst_used += 1
+                    return
+                wait = (1.0 - self.tokens) * self.interval
+            interval_sleep(wait)
+
+    def penalize(self) -> float:
+        """触发限流：清空令牌、作废本轮，并按倍率拉长补充间隔（宁可慢，不可再被罚）"""
+        with self.lock:
+            self.ok_streak = 0
+            self.tokens = 0.0
+            self.burst_used = self.capacity    # 本轮直接作废，强制静默到下一轮
+            self.burst_start = time.monotonic()
+            self.interval = min(self.interval * 1.5, self.max_interval)
+            return self.interval
+
+    def reward(self):
+        """一次顺利请求：连续顺利够多次就把补充间隔收回一档"""
+        with self.lock:
+            self.ok_streak += 1
+            if self.ok_streak >= self.recover_after and self.interval > self.base_interval:
+                self.interval = max(self.base_interval, self.interval / 1.5)
+                self.ok_streak = 0
+
+
+# 翻译接口限流宽松得多（实测 160 次 × 0.2s 间隔零限流），只节流搜索接口
+SEARCH_LIMITER = RateLimiter(capacity=SEARCH_BURST,
+                             refill_interval=REQUEST_INTERVAL,
+                             burst_period=SEARCH_BURST_PERIOD,
+                             max_refill_interval=SEARCH_MAX_INTERVAL,
+                             recover_after=SEARCH_RECOVER_AFTER)
+
+
+# ==================== HTTP 会话（连接复用） ====================
+_tls = threading.local()
+
+
+def get_session() -> requests.Session:
+    """线程内复用的 HTTP 会话（keep-alive + 连接池）。
+
+    早期版本每次请求都用 requests.post 新建连接，一年两万本书就是两万次 TLS
+    握手；穿过本地代理时极易被中途掐断，报
+    `SSL: UNEXPECTED_EOF_WHILE_READING`。实测复用连接后单次延迟从 1.06s 降到
+    0.10s，握手次数降到个位数。"""
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        if PROXIES:
+            s.proxies.update(PROXIES)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8,
+                                                max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _tls.session = s
+    return s
+
+
+def reset_session():
+    """丢弃当前会话：SSL/连接异常后池里那条连接已损坏，重建比复用更稳"""
+    s = getattr(_tls, "session", None)
+    if s is not None:
+        try:
+            s.close()
+        except Exception:
+            pass
+    _tls.session = None
 
 
 # ==================== 接口调用 ====================
@@ -255,25 +391,31 @@ def build_headers(site_key: str) -> dict:
 
 
 def build_body(site_key: str, query: str = "*", filters: dict = None,
-               from_: int = None) -> dict:
-    """构造搜索请求体（与官网前端一致：过滤生效时带 _type=filter）"""
+               from_: int = None, sort_order: str = "asc",
+               facet: list = None, size: int = PAGE_SIZE) -> dict:
+    """构造搜索请求体（与官网前端一致：过滤生效时带 _type=filter）
+
+    排序字段用 title 而非 publication_year：按年份过滤后年份是常量，排序完全
+    并列、翻页顺序不稳定；title 才能给出确定的全序，正倒序两趟才能拼得上。
+
+    facet 默认不带：翻页只要 hits，让服务端顺带算 10 个维度的聚合会明显拖慢
+    每一次请求（大年份能慢到超时）。只有 facet_buckets() 需要时才显式指定。"""
     body = {
         "search_type": "keyword",
         "query": query,
-        "size": PAGE_SIZE,
-        "facet_size": 100,
+        "size": size,
+        "facet_size": FACET_SIZE,
         "source_fields": list(SOURCE_FIELDS),
-        "facet": list(FACETS),
+        "facet": list(facet or []),
         "author": [], "language": [], "publisher": [], "subject": [],
         "keyword": [], "document_type": ["book"], "indicator": [],
-        "sort_field": "publication_year",
-        "sort_order": "desc",
+        "sort_field": "title",
+        "sort_order": sort_order,
     }
-    if site_key != "main":
-        # 主站点不带 collection，其余站点按站点 key 过滤合集
+    if site_key != "main":          # 主站点不带 collection，其余站点按站点 key 过滤合集
         body["collection"] = [site_key]
     filters = filters or {}
-    has_filter = True  # 请求体始终带 document_type=["book"] 过滤
+    has_filter = True               # 请求体始终带 document_type=["book"] 过滤
     for dim in FILTER_DIMS:
         if filters.get(dim):
             body[dim] = list(filters[dim])
@@ -288,47 +430,103 @@ def build_body(site_key: str, query: str = "*", filters: dict = None,
 
 
 def fetch_json(url: str, payload: dict, headers: dict, timeout: int = API_TIMEOUT,
-               retries: int = API_RETRY):
-    """POST JSON 接口，带失败重试与限流退避。成功返回解析后的 dict，失败返回 None"""
+               retries: int = API_RETRY, retry_sleep: float = API_RETRY_SLEEP,
+               quiet: bool = False, limiter: "RateLimiter" = None):
+    """POST JSON 接口，带节流、失败重试与限流退避。成功返回 dict，失败返回 None"""
     wait = THROTTLE_SLEEP
     for attempt in range(1, retries + 1):
         check_stop()
+        if limiter is not None:
+            limiter.acquire()       # 阻塞到满足最小间隔和窗口配额
         try:
-            res = requests.post(url, json=payload, headers=headers,
-                                timeout=timeout, proxies=PROXIES)
+            res = get_session().post(url, json=payload, headers=headers, timeout=timeout)
         except requests.RequestException as e:
-            log_print(f"[!] 请求失败（第{attempt}/{retries}次）: {e}")
-            interval_sleep(API_RETRY_SLEEP)
+            # SSL/连接类异常：连接池里这条连接已废，重建会话再试
+            if isinstance(e, (requests.exceptions.SSLError,
+                              requests.exceptions.ConnectionError,
+                              requests.exceptions.ChunkedEncodingError)):
+                reset_session()
+            if not quiet:
+                log_print(f"[!] 请求失败（第{attempt}/{retries}次）: {type(e).__name__}: "
+                          f"{str(e)[:120]}")
+            interval_sleep(retry_sleep * (2 ** (attempt - 1)))   # 递增退避，别死磕同一个节奏
             continue
         try:
             j = res.json()
         except ValueError:
-            log_print(f"[!] 响应非JSON（第{attempt}/{retries}次）HTTP {res.status_code}: "
-                      f"{res.text[:120]}")
-            interval_sleep(API_RETRY_SLEEP)
+            if not quiet:
+                log_print(f"[!] 响应非JSON（第{attempt}/{retries}次）HTTP {res.status_code}: "
+                          f"{res.text[:120]}")
+            interval_sleep(retry_sleep * (2 ** (attempt - 1)))
             continue
         if (j.get("message") == "Request frequency too high"
                 or j.get("i18nMsg") == "message.request-frequency-too-high"):
-            log_print(f"[!] 触发接口限流，等待 {wait} 秒后重试（第{attempt}/{retries}次）")
+            # 关键：这段冷却期内必须完全不发请求。被拒的请求同样计入限流窗口，
+            # 边等边试会不断延长惩罚（实测每5秒探一次，124秒都没恢复）
+            iv = limiter.penalize() if limiter is not None else None
+            tip = f"，令牌补充放缓到 {iv:.0f}s/个" if iv else ""
+            log_print(f"[!] 触发接口限流，静默 {wait} 秒后重试"
+                      f"（第{attempt}/{retries}次）{tip}")
             interval_sleep(wait)
             wait *= 2
             continue
+        if limiter is not None:
+            limiter.reward()
         return j
     return None
 
 
-def search_page(site_key: str, query: str = "*", filters: dict = None, from_: int = None):
+def search_page(site_key: str, query: str = "*", filters: dict = None,
+                from_: int = None, sort_order: str = "asc",
+                facet: list = None, size: int = PAGE_SIZE):
     """调用搜索接口取一页数据（含 total 与 aggregations）。失败返回 None"""
-    return fetch_json(SEARCH_API, build_body(site_key, query, filters, from_),
-                      build_headers(site_key))
+    return fetch_json(SEARCH_API,
+                      build_body(site_key, query, filters, from_, sort_order, facet, size),
+                      build_headers(site_key), limiter=SEARCH_LIMITER)
+
+
+def facet_buckets(site_key: str, filters: dict, dim: str):
+    """取某个维度的 facet 分桶，返回 (buckets, other)：
+    buckets 为 [(值, 条数), ...]，other 为落在 facet_size 之外的条数。失败返回 (None, 0)
+
+    实测 language 各桶计数与加过滤后的 total 完全一致、other=0，是可靠的互斥分区；
+    publisher/subject 则大量为空或多值，需由调用方判断可信度。"""
+    j = search_page(site_key, filters=filters, facet=[dim], size=1)
+    if j is None:
+        return None, 0
+    aggs = j.get("aggregations") or {}
+    node = aggs.get(f"agg_{dim}") or aggs.get(dim) or {}
+    buckets = node.get("buckets") if isinstance(node, dict) else None
+    if not buckets:
+        return None, 0
+    out = []
+    for b in buckets:
+        key, cnt = b.get("key"), b.get("doc_count") or 0
+        # __MISSING__ 是该字段为空的书，实测无法用它反过来过滤（total=0），跳过
+        if not key or key == "__MISSING__" or not cnt:
+            continue
+        out.append((key, cnt))
+    return out, node.get("sum_other_doc_count") or 0
 
 
 def translate_title(site_key: str, book_id: str, title: str) -> str:
-    """调用翻译接口将书名翻译为中文。失败/无结果返回空字符串"""
+    """调用翻译接口将书名翻译为中文。失败/无结果返回空字符串。
+
+    翻译失败是非致命的（回退英文原名），所以重试次数和退避都比搜索接口小得多：
+    两万本书里哪怕 1% 失败，按搜索接口的 4次×5秒 也要白等一个多小时。"""
+    global _translate_fail
     j = fetch_json(TRANSLATE_API,
                    {"id": book_id, "title": title, "summary": "", "lang": "zh-CN"},
-                   build_headers(site_key))
-    if j and j.get("code") == 200:
+                   build_headers(site_key),
+                   retries=TRANSLATE_RETRY, retry_sleep=TRANSLATE_RETRY_SLEEP,
+                   quiet=True)
+    if j is None:
+        # 单条翻译失败只累计计数，不刷屏；每 50 条汇报一次
+        _translate_fail += 1
+        if _translate_fail % 50 == 0:
+            log_print(f"[!] 翻译接口累计失败 {_translate_fail} 条（已回退英文原名，不影响采集）")
+        return ""
+    if j.get("code") == 200:
         data = j.get("data") or {}
         if data.get("title"):
             return str(data["title"])
@@ -386,7 +584,7 @@ def fetch_site_list() -> list:
     """访问首页获取完整 HTML，再解析 JS bundle 得到 20 个站点。失败回退内置列表"""
     headers = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"}
     try:
-        res = requests.get(HOME_URL, headers=headers, timeout=30, proxies=PROXIES)
+        res = get_session().get(HOME_URL, headers=headers, timeout=30)
         res.raise_for_status()
         html = res.text
         log_print(f"[*] 首页HTML获取成功: {HOME_URL}（长度 {len(html)}）")
@@ -395,7 +593,7 @@ def fetch_site_list() -> list:
             log_print("[!] 首页HTML中未找到 JS bundle 引用，使用内置站点列表")
             return fallback_sites()
         js_url = urljoin(HOME_URL, m.group(1))
-        res2 = requests.get(js_url, headers=headers, timeout=60, proxies=PROXIES)
+        res2 = get_session().get(js_url, headers=headers, timeout=60)
         res2.raise_for_status()
         js = res2.text
         log_print(f"[*] JS bundle 获取成功: {js_url}（长度 {len(js)}）")
@@ -468,8 +666,8 @@ class BookStore:
         self.flush_every = flush_every
         self.path = os.path.join(OUTPUT_DIR, f"worldlibrary_{site_key}.xlsx")
         self.ids_path = os.path.join(OUTPUT_DIR, f"worldlibrary_{site_key}_ids.txt")
-        self.seen_ids = set()  # 已入库书籍ID（内存中以整数/字符串存储）
-        self.pending_ids = []  # 本次新增待登记到 ids.txt 的ID
+        self.seen_ids = set()       # 已入库书籍ID（内存中以整数/字符串存储）
+        self.pending_ids = []       # 本次新增待登记到 ids.txt 的ID
 
         header_ok = self._check_existing_header()
         # txt 注册表优先；无有效Excel时只读txt，避免把损坏文件内容当ID
@@ -486,16 +684,16 @@ class BookStore:
             log_print(f"[!] 已有文件 {os.path.basename(bad)} 表头不匹配或打开失败，"
                       f"已改名备份，本次新建 {os.path.basename(self.path)}")
         if header_ok and os.path.exists(self.path):
-            self.wb = openpyxl.load_workbook(self.path)  # 续写已有文件
+            self.wb = openpyxl.load_workbook(self.path)   # 续写已有文件
             self.ws = self.wb.active
         else:
             self._create_new_workbook()
 
         self.row_count = self.ws.max_row - 1
         self.pending = 0
-        self.added = 0  # 本次运行新增
-        self.dup = 0  # 重复跳过（含历史已采集）
-        self.non_book = 0  # 非 book 类型跳过
+        self.added = 0      # 本次运行新增
+        self.dup = 0        # 重复跳过（含历史已采集）
+        self.non_book = 0   # 非 book 类型跳过
         if self.row_count >= MAX_ROWS_PER_FILE:
             self._rotate()  # 已有文件已超上限：先归档再续写
 
@@ -538,7 +736,7 @@ class BookStore:
                     wb_ro = openpyxl.load_workbook(fp, read_only=True)
                     try:
                         rows = wb_ro.active.iter_rows(values_only=True)
-                        next(rows, None)  # 跳过表头
+                        next(rows, None)    # 跳过表头
                         for row in rows:
                             if row and row[0]:
                                 raw_ids.append(str(row[0]).strip())
@@ -675,168 +873,79 @@ def process_hits(site_key: str, hits: list, store: BookStore):
         store.add_book(item, site_key)
 
 
-def paginate_chunk(site_key: str, query: str, store: BookStore,
-                   first_page: dict = None, label: str = "",
-                   filters: dict = None) -> bool:
-    """对一个分片（数量应 <= WINDOW_LIMIT）完整翻页采集。返回是否完整完成"""
+def paginate_chunk(site_key: str, store: BookStore, filters: dict = None,
+                   label: str = "", sort_order: str = "asc",
+                   first_page: dict = None, want: int = None) -> bool:
+    """沿一个排序方向翻页采集。want 指定本趟要取的条数（默认取到 total）。
+    单趟最多够到 WINDOW_LIMIT 条——接口 from 硬上限 9980，再往后返回空。"""
+    arrow = "正序" if sort_order == "asc" else "倒序"
     if first_page is None:
-        first_page = search_page(site_key, query=query, filters=filters)
-        interval_sleep(REQUEST_INTERVAL)
-    if first_page is None:
-        log_print(f"[!] {label} 首次请求失败，该分片跳过")
-        return False
+        first_page = search_page(site_key, filters=filters, sort_order=sort_order)
+        if first_page is None:
+            log_print(f"[!] {label}[{arrow}] 首次请求失败，跳过")
+            return False
     total = first_page.get("total") or 0
-    if total > WINDOW_LIMIT:
-        log_print(f"[!] {label} 分片总量 {total} 超过单查询上限，仅采集前 {WINDOW_LIMIT} 条")
-        total = WINDOW_LIMIT
     if total == 0:
         return True
-    pages = math.ceil(total / PAGE_SIZE)
-    verbose = pages <= 10  # 小分片每页都打日志（每页含翻译，耗时约1分钟，避免看起来卡住）
-    hits1 = first_page.get("hits") or []
-    if verbose:
-        log_print(f"[采集] {label} 第 1/{pages} 页 本页{len(hits1)}条 处理中...")
-    process_hits(site_key, hits1, store)
-    if verbose:
-        log_print(f"[采集] {label} 第 1/{pages} 页 完成 累计新增{store.added}条 重复{store.dup}条")
-    if pages == 1:
-        return True
+    take = min(total, WINDOW_LIMIT) if want is None else min(want, total, WINDOW_LIMIT)
+    pages = math.ceil(take / PAGE_SIZE)
+    process_hits(site_key, first_page.get("hits") or [], store)
     for pg in range(2, pages + 1):
         check_stop()
-        j = search_page(site_key, query=query, from_=(pg - 1) * PAGE_SIZE, filters=filters)
+        from_ = (pg - 1) * PAGE_SIZE
+        if from_ > MAX_FROM:
+            break
+        j = search_page(site_key, filters=filters, from_=from_, sort_order=sort_order)
         if j is None:
-            log_print(f"[!] {label} 第 {pg}/{pages} 页多次重试仍失败，该分片中断（已采集数据已保存）")
+            log_print(f"[!] {label}[{arrow}] 第 {pg}/{pages} 页重试仍失败，"
+                      f"该趟中断（已采数据已保存）")
             return False
-        hits = j.get("hits") or []
-        if verbose:
-            log_print(f"[采集] {label} 第 {pg}/{pages} 页 本页{len(hits)}条 处理中...")
-        process_hits(site_key, hits, store)
-        if verbose:
-            log_print(f"[采集] {label} 第 {pg}/{pages} 页 完成 累计新增{store.added}条 重复{store.dup}条")
-        elif pg % 10 == 0 or pg == pages:
-            log_print(f"[采集] {label} 第 {pg}/{pages} 页 累计新增{store.added}条 重复{store.dup}条")
-        interval_sleep(REQUEST_INTERVAL)
-    return True
-
-
-def _count_query(site_key: str, query: str, filters: dict = None):
-    """查询某个 query 的总条数（顺带返回第 1 页数据供翻页复用）。失败返回 None"""
-    j = search_page(site_key, query=query, filters=filters)
-    interval_sleep(REQUEST_INTERVAL)
-    return j
-
-
-# 分片递归进度统计
-_split_probe_count = 0
-
-
-def _range_query(lo: str, hi: str) -> str:
-    return f"title:[* TO {hi}]" if lo == "*" else f"title:[{lo} TO {hi}]"
-
-
-def _probe(site_key: str, query: str, store: BookStore, filters: dict = None):
-    """探测一个查询的总数，并把第 1 页的 20 条直接入库（去重防重复）。
-    返回 (cnt, first_page)；查询失败返回 (None, None)"""
-    global _split_probe_count
-    j = _count_query(site_key, query, filters=filters)
-    _split_probe_count += 1
-    if _split_probe_count % 50 == 0:
-        log_print(f"[分片] 已探测 {_split_probe_count} 个查询")
-    if j is None:
-        return None, None
-    cnt = j.get("total") or 0
-    if cnt:
         process_hits(site_key, j.get("hits") or [], store)
-    return cnt, j
-
-
-def split_prefix_level(site_key: str, p: str, store: BookStore, top_hi: str,
-                       depth: int = 0, filters: dict = None) -> bool:
-    """按前缀 p 枚举采集：[p0 TO p1]...[pz TO top_hi] 共 36 块，
-    覆盖 p 开头的多字符词条 + 边界词条（无缺口）。超限的块递归到下一层字符。
-    尾部块 [pz TO top_hi] 包含边界词条（其书由 top_hi 自己的区间覆盖），
-    递归到深处仍未拆开时直接跳过，避免大量重复翻页"""
-    check_stop()
-    for i, c in enumerate(ALNUM):
-        nxt = p + ALNUM[i + 1] if i + 1 < len(ALNUM) else top_hi
-        q = f"title:[{p}{c} TO {nxt}]"
-        cnt, j = _probe(site_key, q, store, filters=filters)
-        if cnt is None:
-            log_print(f"[!] 分片 {q} 查询失败，跳过")
-            continue
-        if cnt == 0:
-            continue
-        if cnt <= WINDOW_LIMIT:
-            paginate_chunk(site_key, q, store, first_page=j, label=q, filters=filters)
-        elif i + 1 < len(ALNUM):
-            split_prefix_level(site_key, p + c, store, nxt, depth + 1, filters)
-        elif depth < 20:
-            # 尾部 [pz TO top_hi]：继续按下一层字符拆分（剩余主体为边界词条的书，
-            # 它们已由 top_hi 区间覆盖；拆到最深层仍超限时跳过）
-            split_prefix_level(site_key, p + c, store, top_hi, depth + 1, filters)
-        else:
-            log_print(f"[*] 分片 {q} 拆分到最深层仍超上限（{cnt} 条），"
-                      f"其中边界词条书籍已由其它分片覆盖，跳过")
+        if pg % 20 == 0 or pg == pages:
+            log_print(f"[采集] {label}[{arrow}] 第 {pg}/{pages} 页 "
+                      f"累计新增{store.added}条 重复{store.dup}条")
     return True
 
 
-def split_range(site_key: str, lo: str, hi: str, store: BookStore,
-                filters: dict = None) -> bool:
-    """范围分片 [lo TO hi]（单字符边界，lo 可为 "*" 开区间），无缺口递归拆分：
-    - 单字符范围按字符（或 ALNUM 下标）二分
-    - 相邻字符 [x TO y] = 裸词条x + x开头多字符词条 + 边界词条y，用前缀枚举完整覆盖"""
-    check_stop()
-    q = _range_query(lo, hi)
-    cnt, j = _probe(site_key, q, store, filters=filters)
-    if cnt is None:
-        log_print(f"[!] 范围 {q} 查询失败，跳过")
-        return False
-    if cnt == 0:
-        return True
-    if cnt <= WINDOW_LIMIT:
-        return paginate_chunk(site_key, q, store, first_page=j, label=q, filters=filters)
-    if lo == "*":
-        return split_range(site_key, "0", hi, store, filters=filters)
-    if ord(hi) - ord(lo) >= 2:
-        if lo in ALNUM and hi in ALNUM:
-            m = ALNUM[(ALNUM.index(lo) + ALNUM.index(hi)) // 2]
-            return (split_range(site_key, lo, m, store, filters=filters)
-                    and split_range(site_key, ALNUM[ALNUM.index(m) + 1], hi, store,
-                                    filters=filters))
-        mid = chr((ord(lo) + ord(hi)) // 2)
-        return (split_range(site_key, lo, mid, store, filters=filters)
-                and split_range(site_key, chr(ord(mid) + 1), hi, store, filters=filters))
-    # 相邻字符 [x TO y]
-    c0, j0 = _probe(site_key, f"title:[{lo} TO {lo}]", store, filters=filters)
-    if c0:
-        if c0 <= WINDOW_LIMIT:
-            paginate_chunk(site_key, f"title:[{lo} TO {lo}]", store, first_page=j0,
-                           label=f"title:{lo}", filters=filters)
-        else:
-            log_print(f"[*] 词条[{lo}]单独覆盖 {c0} 本（超过单查询上限），"
-                      f"这些书将依赖其它词条分片覆盖，跳过")
-    if lo in ALNUM:
-        return split_prefix_level(site_key, lo, store, hi, filters=filters)
-    # 非ASCII相邻区间：前缀兜底
-    q2 = f"title:{lo}*"
-    c2, j2 = _probe(site_key, q2, store, filters=filters)
-    if c2 is None:
-        return False
-    if c2 <= WINDOW_LIMIT:
-        return paginate_chunk(site_key, q2, store, first_page=j2, label=q2, filters=filters)
-    # 超限：说明该字符被分析器折叠（如 À→a），对应书籍已由 a‑z 等区间覆盖，跳过
-    log_print(f"[*] 词条 {lo} 开头查询到 {c2} 本（超过单查询上限），"
-              f"这些书应已由其它分片覆盖，跳过")
-    return True
-
-
-def _collect_query(site_key: str, filters: dict, store: BookStore, label: str,
+def collect_window(site_key: str, filters: dict, store: BookStore, label: str,
                    page1: dict = None) -> bool:
-    """对"站点+年份(可选)"的一个查询范围完整采集：数量不超限则直接翻页，
-    超限则按标题词条范围递归分片。返回 True 表示完成"""
+    """采集一个总量已知的查询范围（应 <= FLIP_LIMIT）：
+    - <=10000：正序一趟走完
+    - 10000~20000：正序取前 10000 + 倒序取剩下的，两趟拼成全量
+      （单方向够不到第 10000 条以后，倒序正好补上尾部）"""
     if page1 is None:
-        page1 = search_page(site_key, filters=filters)
-        interval_sleep(REQUEST_INTERVAL)
+        page1 = search_page(site_key, filters=filters, sort_order="asc")
+        if page1 is None:
+            log_print(f"[!] {label} 首次请求失败，跳过")
+            return False
+    total = page1.get("total") or 0
+    if total == 0:
+        log_print(f"[*] {label}: 无数据，跳过")
+        return True
+    if total <= WINDOW_LIMIT:
+        log_print(f"[*] {label}: 共 {total} 本，{math.ceil(total / PAGE_SIZE)} 页，正序翻页采集")
+        return paginate_chunk(site_key, store, filters, label, "asc", page1)
+    # 拼接处留 SEAM_MARGIN 条重叠：同名书排序并列时顺序不稳定，重叠靠ID去重兜掉
+    rest = min(total - WINDOW_LIMIT + SEAM_MARGIN, WINDOW_LIMIT)
+    lost = total - WINDOW_LIMIT - rest
+    tail = f"，中间 {lost} 本够不到" if lost > 0 else ""
+    log_print(f"[*] {label}: 共 {total} 本，超过单向上限（{WINDOW_LIMIT}）；"
+              f"正序取前 {WINDOW_LIMIT} 条 + 倒序取后 {rest} 条拼接{tail}")
+    ok = paginate_chunk(site_key, store, filters, label, "asc", page1)
+    ok &= paginate_chunk(site_key, store, filters, label, "desc", want=rest)
+    return ok
+
+
+def collect_partition(site_key: str, filters: dict, store: BookStore, label: str,
+                      dim_idx: int = 0) -> bool:
+    """完整采集一个查询范围：
+    - 总量 <= 20000：正倒序两趟直接拿全
+    - 超过：按 PARTITION_DIMS 里的 facet 维度切成互斥子分区，逐个递归
+
+    facet 分桶是真正的互斥分区（实测各桶计数与加过滤后的 total 完全一致），
+    这点和已废弃的 title:[lo TO hi] 词条范围分片有本质区别。"""
+    filters = dict(filters or {})
+    page1 = search_page(site_key, filters=filters, sort_order="asc")
     if page1 is None:
         log_print(f"[!] {label} 首次请求失败，跳过")
         return False
@@ -844,23 +953,70 @@ def _collect_query(site_key: str, filters: dict, store: BookStore, label: str,
     if total == 0:
         log_print(f"[*] {label}: 无数据，跳过")
         return True
-    if total <= WINDOW_LIMIT:
-        log_print(f"[*] {label}: 共 {total} 本，{math.ceil(total / PAGE_SIZE)} 页，直接翻页采集")
-        return paginate_chunk(site_key, "*", store, first_page=page1, label=label,
-                              filters=filters)
-    log_print(f"[*] {label}: 共 {total} 本，超过接口单查询上限（{WINDOW_LIMIT}），"
-              f"按书名标题词条范围递归分片采集")
-    ok = True
-    for lo, hi in TOP_TITLE_RANGES:
-        ok &= split_range(site_key, lo, hi, store, filters=filters)
-    return ok
+    if total <= FLIP_LIMIT:
+        return collect_window(site_key, filters, store, label, page1)
+
+    # 挑分区维度。两条判据：
+    # 1) 分桶必须"可信"：other==0（没有 facet_size 之外的漏桶）且 covered<=total
+    #    （covered>total 说明该字段是多值的，如 subject 一本书挂多个主题，
+    #    分桶计数在重复计算，根本无法用来判断覆盖了多少本书）
+    # 2) 覆盖数必须超过"直接正倒序拼接"能拿到的量，否则分区反而更亏
+    #    （如某年 english 21893 本，按 publisher 只覆盖 7833 本，不如拼接拿 20000）
+    baseline = min(total, FLIP_LIMIT)
+    best = None                 # (覆盖数, 维度, 分桶, 维度下标)
+    for i in range(dim_idx, len(PARTITION_DIMS)):
+        check_stop()
+        dim = PARTITION_DIMS[i]
+        if filters.get(dim):    # 该维度已被上层切过
+            continue
+        buckets, other = facet_buckets(site_key, filters, dim)
+        if not buckets or len(buckets) < 2:
+            continue
+        covered = sum(c for _, c in buckets)
+        if other or covered > total:
+            reason = (f"还有 {other} 条落在 {FACET_SIZE} 个桶之外" if other
+                      else f"分桶合计 {covered} 超过总数，是多值字段")
+            log_print(f"[分区] {label}: {dim} 不可用（{reason}）")
+            continue
+        log_print(f"[分区] {label}: {dim} 可切 {len(buckets)} 桶，覆盖 {covered}/{total} 本")
+        if best is None or covered > best[0]:
+            best = (covered, dim, buckets, i)
+        if covered >= total:    # 已完全覆盖，不必再看其它维度
+            break
+
+    if best and best[0] > baseline:
+        covered, dim, buckets, i = best
+        log_print(f"[分区] {label}: 共 {total} 本，超过 {FLIP_LIMIT} 条上限，"
+                  f"按 {dim} 切成 {len(buckets)} 个子分区（覆盖 {covered}/{total} 本）")
+        if covered < total:
+            log_print(f"[!] {label}: {dim} 分桶差 {total - covered} 本未覆盖"
+                      f"（该字段为空的书接口无法反查），这部分会漏采")
+        ok = True
+        for val, cnt in buckets:
+            check_stop()
+            sub = dict(filters)
+            sub[dim] = [val]
+            ok &= collect_partition(site_key, sub, store,
+                                    f"{label}/{dim}={val}({cnt})", i + 1)
+        return ok
+
+    log_print(f"[!] {label}: 共 {total} 本，没有可信且更划算的分区维度"
+              f"（最好的只覆盖 {best[0] if best else 0} 本），"
+              f"改为正倒序拼接取约 {baseline} 本，其余 {total - baseline} 本采不到")
+    return collect_window(site_key, filters, store, label, page1)
+
+
+def _collect_query(site_key: str, filters: dict, store: BookStore, label: str) -> bool:
+    """对"站点+年份(可选)"的一个查询范围完整采集"""
+    return collect_partition(site_key, filters, store, label)
 
 
 def collect_site(site: dict, year_start: int = None, year_end: int = None):
     """采集一个站点。year_start/year_end 为 None 表示全站采集；
     否则按年份从 year_start 到 year_end 一年一年请求"""
-    global _split_probe_count
-    _split_probe_count = 0
+    global _translate_fail
+    _translate_fail = 0
+    reset_session()     # 每次任务用全新会话，避免复用上次残留的坏连接
     key = site["key"]
     zh = f"（{site['name_zh']}）" if site.get("name_zh") else ""
     year_info = (f"  年份范围: {year_start} ~ {year_end}（按年逐次请求）"
@@ -870,7 +1026,8 @@ def collect_site(site: dict, year_start: int = None, year_end: int = None):
     log_print(f"  搜索接口: {SEARCH_API}")
     log_print(f"  Referer: {site['search_url']}")
     log_print(year_info)
-    log_print(f"  每页 {PAGE_SIZE} 条  间隔 {REQUEST_INTERVAL} 秒  只取 document_type=book")
+    log_print(f"  每页 {PAGE_SIZE} 条  节流: 每 {SEARCH_BURST_PERIOD:.0f} 秒最多 "
+              f"{SEARCH_BURST} 次  只取 document_type=book")
     log_print("=" * 65 + "\n")
 
     store = BookStore(key)
@@ -889,6 +1046,8 @@ def collect_site(site: dict, year_start: int = None, year_end: int = None):
     log_print("\n" + "=" * 65)
     log_print(f"[+] 采集结束：本次新增 {store.added} 条，跳过重复 {store.dup} 条，"
               f"非book类型 {store.non_book} 条，文件累计 {store.row_count} 条")
+    if _translate_fail:
+        log_print(f"[+] 其中 {_translate_fail} 条书名翻译失败，已回退英文原名")
     log_print(f"[+] 输出文件: {os.path.abspath(store.path)}")
     log_print("=" * 65 + "\n")
 
@@ -942,7 +1101,7 @@ class App:
         self.running = False
         self.worker_thread = None
         self.consume_log_queue()
-        self.load_sites()  # 启动时后台获取站点列表
+        self.load_sites()   # 启动时后台获取站点列表
 
     def consume_log_queue(self):
         try:
