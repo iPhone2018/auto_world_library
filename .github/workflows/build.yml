@@ -7,6 +7,7 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,24 +23,29 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          pip install pyinstaller requests openpyxl
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-      - name: Build EXE with PyInstaller
+      - name: Build with PyInstaller（目录模式，禁用onefile）
         run: |
-          # 去掉--onefile，文件名全部英文，保留--windowed无控制台
-          pyinstaller --windowed --name "worldlibrary_tool" main.py
+          pyinstaller `
+            --windowed `
+            --noconsole `
+            --name "worldlibrary_tool" `
+            --clean `
+            main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: dist/
+          name: worldlibrary_tool-windows
+          path: dist/worldlibrary_tool/
 
-      - name: Create Release (if tag pushed)
+      - name: Create Release (tag触发)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/**/*
+          files: dist/worldlibrary_tool/**/*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
